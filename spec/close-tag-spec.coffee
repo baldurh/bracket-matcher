@@ -10,7 +10,7 @@ describe 'closeTag', ->
 
     it 'returns the last not closed elem in fragment, matching a given pattern', ->
       stack = tagFinder.parseFragment fragment, [], /<(\w+)|<\/(\w*)/, -> true
-      expect(stack[stack.length-1]).toBe("head")
+      expect(stack[stack.length - 1]).toBe("head")
 
     it 'stops when cond become true',  ->
       stack = tagFinder.parseFragment fragment, [], /<(\w+)|<\/(\w*)/, -> false
@@ -18,18 +18,29 @@ describe 'closeTag', ->
 
     it 'uses the given match expression to match tags', ->
       stack = tagFinder.parseFragment fragment, [], /<(body)|(notag)/, -> true
-      expect(stack[stack.length-1]).toBe("body")
+      expect(stack[stack.length - 1]).toBe("body")
 
   describe 'TagFinder::tagsNotClosedInFragment', ->
     it 'returns the outermost tag not closed in an HTML fragment', ->
       fragment = "<html><head></head><body><h1><p></p>"
       tags = tagFinder.tagsNotClosedInFragment(fragment)
-      expect(tags).toEqual(['html','body','h1'])
+      expect(tags).toEqual(['html', 'body', 'h1'])
+
+    # Is this desirable? It results in malformed XML for closing tag insertions.
+    it 'detects an incomplete tag', ->
+      fragment = '<html<body<h1'
+      tags = tagFinder.tagsNotClosedInFragment(fragment)
+      expect(tags).toEqual(['html', 'body', 'h1'])
 
     it 'is not confused by tag attributes', ->
       fragment = '<html><head></head><body class="c"><h1 class="p"><p></p>'
       tags = tagFinder.tagsNotClosedInFragment(fragment)
-      expect(tags).toEqual(['html','body','h1'])
+      expect(tags).toEqual(['html', 'body', 'h1'])
+
+    it 'is not confused by namespace prefixes', ->
+      fragment = '<xhtml:html><xhtml:body><xhtml:h1>'
+      tags = tagFinder.tagsNotClosedInFragment(fragment)
+      expect(tags).toEqual(['xhtml:html', 'xhtml:body', 'xhtml:h1'])
 
   describe 'TagFinder::tagDoesNotCloseInFragment', ->
     it 'returns true if the given tag is not closed in the given fragment', ->
@@ -68,3 +79,8 @@ describe 'closeTag', ->
       preFragment = "<html><head></head><body><h1></h1><p>"
       postFragment = "</p></body></html>"
       expect(tagFinder.closingTagForFragments(preFragment, postFragment)).toBe(null)
+
+    it "correctly closes tags containing hyphens", ->
+      preFragment = "<html><head></head><body><h1></h1><my-element>"
+      postFragment = "</body></html>"
+      expect(tagFinder.closingTagForFragments(preFragment, postFragment)).toBe("my-element")

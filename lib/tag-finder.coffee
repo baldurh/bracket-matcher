@@ -1,6 +1,6 @@
 {Range} = require 'atom'
 _ = require 'underscore-plus'
-{ScopeSelector} = require 'first-mate'
+SelectorCache = require './selector-cache'
 SelfClosingTags = require './self-closing-tags'
 
 # Helper to find the matching start/end tag for the start/end tag under the
@@ -10,19 +10,23 @@ class TagFinder
   constructor: (@editor) ->
     @tagPattern = /(<(\/?))([^\s>]+)([\s>]|$)/
     @wordRegex = /[^>\r\n]*/
-    @tagSelector = new ScopeSelector('meta.tag | punctuation.definition.tag')
-    @commentSelector = new ScopeSelector('comment.*')
+    @tagSelector = SelectorCache.get('meta.tag | punctuation.definition.tag')
+    @commentSelector = SelectorCache.get('comment.*')
 
   patternForTagName: (tagName) ->
     tagName = _.escapeRegExp(tagName)
     new RegExp("(<#{tagName}([\\s>]|$))|(</#{tagName}>)", 'gi')
 
   isRangeCommented: (range) ->
-    scopes = @editor.scopesForBufferPosition(range.start)
+    scopes = @editor.scopeDescriptorForBufferPosition(range.start).getScopesArray()
     @commentSelector.matches(scopes)
 
+  isTagRange: (range) ->
+    scopes = @editor.scopeDescriptorForBufferPosition(range.start).getScopesArray()
+    @tagSelector.matches(scopes)
+
   isCursorOnTag: ->
-    @tagSelector.matches(@editor.getCursorScopes())
+    @tagSelector.matches(@editor.getLastCursor().getScopeDescriptor().getScopesArray())
 
   findStartTag: (tagName, endPosition) ->
     scanRange = new Range([0, 0], endPosition)
@@ -60,11 +64,9 @@ class TagFinder
 
     endRange
 
-  findMatchingTags: ->
-    return unless @isCursorOnTag()
-
+  findStartEndTags: ->
     ranges = null
-    endPosition = @editor.getCursor().getCurrentWordBufferRange({@wordRegex}).end
+    endPosition = @editor.getLastCursor().getCurrentWordBufferRange({@wordRegex}).end
     @editor.backwardsScanInBufferRange @tagPattern, [[0, 0], endPosition], ({match, range, stop}) =>
       stop()
 
@@ -82,6 +84,16 @@ class TagFinder
 
       ranges = {startRange, endRange} if startRange? and endRange?
     ranges
+
+  findEnclosingTags: ->
+    if ranges = @findStartEndTags()
+      if @isTagRange(ranges.startRange) and @isTagRange(ranges.endRange)
+        return ranges
+
+    null
+
+  findMatchingTags: ->
+    @findStartEndTags() if @isCursorOnTag()
 
   # Parses a fragment of html returning the stack (i.e., an array) of open tags
   #
@@ -120,7 +132,7 @@ class TagFinder
   #
   # Returns a string with the name of the most recent unclosed tag.
   tagsNotClosedInFragment: (fragment) ->
-    @parseFragment fragment, [], /<(\w+)|<\/(\w+)/, -> true
+    @parseFragment fragment, [], /<(\w[-\w]*(?:\:\w[-\w]*)?)|<\/(\w[-\w]*(?:\:\w[-\w]*)?)/, -> true
 
   # Parses the given fragment of html code and returns true if the given tag
   # has a matching closing tag in it. If tag is reopened and reclosed in the
@@ -131,8 +143,9 @@ class TagFinder
 
     stack = tags
     stackLength = stack.length
-    tag = _.escapeRegExp(tags[tags.length-1])
-    matchExpr = new RegExp("<(#{tag})|<\/(#{tag})")
+    tag = tags[tags.length-1]
+    escapedTag = _.escapeRegExp(tag)
+    matchExpr = new RegExp("<(#{escapedTag})|<\/(#{escapedTag})")
     stack = @parseFragment fragment, stack, matchExpr, (s) ->
       s.length >= stackLength or s[s.length-1] is tag
 

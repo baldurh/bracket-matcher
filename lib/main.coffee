@@ -1,14 +1,11 @@
-BracketMatcher = require './bracket-matcher'
+MatchManager = require './match-manager'
 BracketMatcherView = require './bracket-matcher-view'
+BracketMatcher = require './bracket-matcher'
 
 module.exports =
-  configDefaults:
-    autocompleteBrackets: true
-    autocompleteSmartQuotes: true
-    wrapSelectionsInBrackets: true
-
   activate: ->
-    atom.workspaceView.eachEditorView (editorView) ->
-      if editorView.attached and editorView.getPane()?
-        new BracketMatcherView(editorView)
-        new BracketMatcher(editorView)
+    atom.workspace.observeTextEditors (editor) ->
+      editorElement = atom.views.getView(editor)
+      matchManager = new MatchManager(editor, editorElement)
+      new BracketMatcherView(editor, editorElement, matchManager)
+      new BracketMatcher(editor, editorElement, matchManager)

@@ -1,187 +1,178 @@
+{CompositeDisposable} = require 'atom'
 _ = require 'underscore-plus'
-{Range, View} = require 'atom'
+{Range, Point} = require 'atom'
 TagFinder = require './tag-finder'
+SelectorCache = require './selector-cache'
 
-startPairMatches =
-  '(': ')'
-  '[': ']'
-  '{': '}'
-
-endPairMatches =
-  ')': '('
-  ']': '['
-  '}': '{'
-
-pairRegexes = {}
-for startPair, endPair of startPairMatches
-  pairRegexes[startPair] = new RegExp("[#{_.escapeRegExp(startPair + endPair)}]", 'g')
+MAX_ROWS_TO_SCAN = 10000
 
 module.exports =
-class BracketMatcherView extends View
-  @content: ->
-    @div =>
-      @div class: 'bracket-matcher', style: 'display: none', outlet: 'startView'
-      @div class: 'bracket-matcher', style: 'display: none', outlet: 'endView'
-
-  initialize: (@editorView) ->
-    {@editor} = @editorView
+class BracketMatcherView
+  constructor: (@editor, editorElement, @matchManager) ->
+    @subscriptions = new CompositeDisposable
     @tagFinder = new TagFinder(@editor)
     @pairHighlighted = false
-    @updateHighlights = false
+    @tagHighlighted = false
+    @commentOrStringSelector = SelectorCache.get('comment.* | string.*')
 
-    @subscribe atom.config.observe 'editor.fontSize', =>
-      @updateMatch()
+    @subscriptions.add @editor.onDidTokenize(@updateMatch)
+    @subscriptions.add @editor.getBuffer().onDidChangeText(@updateMatch)
+    @subscriptions.add @editor.onDidChangeGrammar(@updateMatch)
+    @subscriptions.add @editor.onDidChangeSelectionRange(@updateMatch)
+    @subscriptions.add @editor.onDidAddCursor(@updateMatch)
+    @subscriptions.add @editor.onDidRemoveCursor(@updateMatch)
 
-    @subscribe @editor.getBuffer(), 'changed', =>
-      @updateHighlights = true
-
-    @subscribe @editor, 'screen-lines-changed', =>
-      @updateHighlights = true
-
-    @subscribe @editorView, 'editor:display-updated', =>
-      if @updateHighlights
-        @updateHighlights = false
-        @updateMatch()
-
-    @subscribe @editorView, 'editor:min-width-changed', =>
-      @updateHighlights = true if @editor.getSoftWrap()
-
-    @subscribe @editor, 'soft-wrap-changed', =>
-      @updateHighlights = true
-
-    @subscribe @editor, 'grammar-changed', =>
-      @updateHighlights = true
-
-    @subscribeToCursor()
-
-    @subscribeToCommand @editorView, 'bracket-matcher:go-to-matching-bracket', =>
+    @subscriptions.add atom.commands.add editorElement, 'bracket-matcher:go-to-matching-bracket', =>
       @goToMatchingPair()
 
-    @subscribeToCommand @editorView, 'bracket-matcher:go-to-enclosing-bracket', =>
+    @subscriptions.add atom.commands.add editorElement, 'bracket-matcher:go-to-enclosing-bracket', =>
       @goToEnclosingPair()
 
-    @subscribeToCommand @editorView, 'bracket-matcher:select-inside-brackets', =>
+    @subscriptions.add atom.commands.add editorElement, 'bracket-matcher:select-inside-brackets', =>
       @selectInsidePair()
 
-    @subscribeToCommand @editorView, 'bracket-matcher:close-tag', =>
+    @subscriptions.add atom.commands.add editorElement, 'bracket-matcher:close-tag', =>
       @closeTag()
 
-    @editorView.underlayer.append(this)
+    @subscriptions.add atom.commands.add editorElement, 'bracket-matcher:remove-matching-brackets', =>
+      @removeMatchingBrackets()
+
+    @subscriptions.add @editor.onDidDestroy @destroy
+
     @updateMatch()
 
-  subscribeToCursor: ->
-    cursor = @editor.getCursor()
-    return unless cursor?
+  destroy: =>
+    @subscriptions.dispose()
 
-    @subscribe cursor, 'moved', =>
-      @updateMatch()
-
-    @subscribe cursor, 'destroyed', =>
-      @unsubscribe(cursor)
-      @subscribeToCursor()
-      @updateMatch() if @editor.isAlive()
-
-  updateMatch: ->
+  updateMatch: =>
     if @pairHighlighted
-      @startView.hide()
-      @endView.hide()
+      @editor.destroyMarker(@startMarker.id)
+      @editor.destroyMarker(@endMarker.id)
+
     @pairHighlighted = false
+    @tagHighlighted = false
 
-    return unless @editor.getSelection().isEmpty()
+    return unless @editor.getLastSelection().isEmpty()
     return if @editor.isFoldedAtCursorRow()
+    return if @isCursorOnCommentOrString()
 
-    {position, currentPair, matchingPair} = @findCurrentPair(startPairMatches)
+    {position, currentPair, matchingPair} = @findCurrentPair(@matchManager.pairedCharacters)
     if position
       matchPosition = @findMatchingEndPair(position, currentPair, matchingPair)
     else
-      {position, currentPair, matchingPair} = @findCurrentPair(endPairMatches)
+      {position, currentPair, matchingPair} = @findCurrentPair(@matchManager.pairedCharactersInverse)
       if position
         matchPosition = @findMatchingStartPair(position, matchingPair, currentPair)
 
     if position? and matchPosition?
-      @moveStartView([position, position.translate([0, 1])])
-      @moveEndView([matchPosition, matchPosition.translate([0, 1])])
+      @startMarker = @createMarker([position, position.traverse([0, 1])])
+      @endMarker = @createMarker([matchPosition, matchPosition.traverse([0, 1])])
       @pairHighlighted = true
     else
       if pair = @tagFinder.findMatchingTags()
-        @moveStartView(pair.startRange)
-        @moveEndView(pair.endRange)
+        @startMarker = @createMarker(pair.startRange)
+        @endMarker = @createMarker(pair.endRange)
         @pairHighlighted = true
+        @tagHighlighted = true
+
+  removeMatchingBrackets: ->
+    return @editor.backspace() if @editor.hasMultipleCursors()
+
+    @editor.transact =>
+      @editor.selectLeft() if @editor.getLastSelection().isEmpty()
+      text = @editor.getSelectedText()
+
+      #check if the character to the left is part of a pair
+      if @matchManager.pairedCharacters.hasOwnProperty(text) or @matchManager.pairedCharactersInverse.hasOwnProperty(text)
+        {position, currentPair, matchingPair} = @findCurrentPair(@matchManager.pairedCharacters)
+        if position
+          matchPosition = @findMatchingEndPair(position, currentPair, matchingPair)
+        else
+          {position, currentPair, matchingPair} = @findCurrentPair(@matchManager.pairedCharactersInverse)
+          if position
+            matchPosition = @findMatchingStartPair(position, matchingPair, currentPair)
+
+        if position? and matchPosition?
+          @editor.setCursorBufferPosition(matchPosition)
+          @editor.delete()
+          # if on the same line and the cursor is in front of an end pair
+          # offset by one to make up for the missing character
+          if position.row is matchPosition.row and @matchManager.pairedCharactersInverse.hasOwnProperty(currentPair)
+            position = position.traverse([0, -1])
+          @editor.setCursorBufferPosition(position)
+          @editor.delete()
+        else
+          @editor.backspace()
+      else
+        @editor.backspace()
 
   findMatchingEndPair: (startPairPosition, startPair, endPair) ->
-    scanRange = new Range(startPairPosition.translate([0, 1]), @editor.buffer.getEndPosition())
+    return if startPair is endPair
+
+    scanRange = new Range(startPairPosition.traverse([0, 1]), startPairPosition.traverse([MAX_ROWS_TO_SCAN, 0]))
     endPairPosition = null
     unpairedCount = 0
-    @editor.scanInBufferRange pairRegexes[startPair], scanRange, ({match, range, stop}) ->
-      switch match[0]
+    @editor.scanInBufferRange @matchManager.pairRegexes[startPair], scanRange, (result) =>
+      return if @isRangeCommentedOrString(result.range)
+      switch result.match[0]
         when startPair
           unpairedCount++
         when endPair
           unpairedCount--
           if unpairedCount < 0
-            endPairPosition = range.start
-            stop()
+            endPairPosition = result.range.start
+            result.stop()
 
     endPairPosition
 
   findMatchingStartPair: (endPairPosition, startPair, endPair) ->
-    scanRange = new Range([0, 0], endPairPosition)
+    return if startPair is endPair
+
+    scanRange = new Range(endPairPosition.traverse([-MAX_ROWS_TO_SCAN, 0]), endPairPosition)
     startPairPosition = null
     unpairedCount = 0
-    @editor.backwardsScanInBufferRange pairRegexes[startPair], scanRange, ({match, range, stop}) ->
-      switch match[0]
+    @editor.backwardsScanInBufferRange @matchManager.pairRegexes[startPair], scanRange, (result) =>
+      return if @isRangeCommentedOrString(result.range)
+      switch result.match[0]
         when startPair
           unpairedCount--
           if unpairedCount < 0
-            startPairPosition = range.start
-            stop()
+            startPairPosition = result.range.start
+            result.stop()
         when endPair
           unpairedCount++
     startPairPosition
 
   findAnyStartPair: (cursorPosition) ->
     scanRange = new Range([0, 0], cursorPosition)
-    startPair = _.escapeRegExp(_.keys(startPairMatches).join(''))
-    endPair = _.escapeRegExp(_.keys(endPairMatches).join(''))
+    startPair = _.escapeRegExp(_.keys(@matchManager.pairedCharacters).join(''))
+    endPair = _.escapeRegExp(_.keys(@matchManager.pairedCharactersInverse).join(''))
     combinedRegExp = new RegExp("[#{startPair}#{endPair}]", 'g')
     startPairRegExp = new RegExp("[#{startPair}]", 'g')
     endPairRegExp = new RegExp("[#{endPair}]", 'g')
     startPosition = null
     unpairedCount = 0
-    @editor.backwardsScanInBufferRange combinedRegExp, scanRange, ({match, range, stop}) =>
-      if match[0].match(endPairRegExp)
+    @editor.backwardsScanInBufferRange combinedRegExp, scanRange, (result) =>
+      return if @isRangeCommentedOrString(result.range)
+      if result.match[0].match(endPairRegExp)
         unpairedCount++
-      else if match[0].match(startPairRegExp)
+      else if result.match[0].match(startPairRegExp)
         unpairedCount--
-        startPosition = range.start
-        stop() if unpairedCount < 0
+        if unpairedCount < 0
+          startPosition = result.range.start
+          result.stop()
      startPosition
 
-  moveHighlightView: (view, bufferRange) ->
-    bufferRange = Range.fromObject(bufferRange)
-    view.bufferPosition = bufferRange.start
-
-    startPixelPosition = @editorView.pixelPositionForBufferPosition(bufferRange.start)
-    endPixelPosition = @editorView.pixelPositionForBufferPosition(bufferRange.end)
-
-    [element] = view
-    element.style.display = 'block'
-    element.style.top = "#{startPixelPosition.top}px"
-    element.style.left = "#{startPixelPosition.left}px"
-    element.style.width = "#{endPixelPosition.left - startPixelPosition.left}px"
-    element.style.height = "#{@editorView.lineHeight}px"
-
-  moveStartView: (bufferRange) ->
-    @moveHighlightView(@startView, bufferRange)
-
-  moveEndView: (bufferRange) ->
-    @moveHighlightView(@endView, bufferRange)
+  createMarker: (bufferRange) ->
+    marker = @editor.markBufferRange(bufferRange)
+    @editor.decorateMarker(marker, type: 'highlight', class: 'bracket-matcher', deprecatedRegionClass: 'bracket-matcher')
+    marker
 
   findCurrentPair: (matches) ->
     position = @editor.getCursorBufferPosition()
     currentPair = @editor.getTextInRange(Range.fromPointWithDelta(position, 0, 1))
     unless matches[currentPair]
-      position = position.translate([0, -1])
+      position = position.traverse([0, -1])
       currentPair = @editor.getTextInRange(Range.fromPointWithDelta(position, 0, 1))
     if matchingPair = matches[currentPair]
       {position, currentPair, matchingPair}
@@ -190,52 +181,96 @@ class BracketMatcherView extends View
 
   goToMatchingPair: ->
     return @goToEnclosingPair() unless @pairHighlighted
-    return unless @editorView.underlayer.isVisible()
-
     position = @editor.getCursorBufferPosition()
-    previousPosition = position.translate([0, -1])
-    startPosition = @startView.bufferPosition
-    endPosition = @endView.bufferPosition
 
-    if position.isEqual(startPosition)
-      @editor.setCursorBufferPosition(endPosition.translate([0, 1]))
-    else if previousPosition.isEqual(startPosition)
-      @editor.setCursorBufferPosition(endPosition)
-    else if position.isEqual(endPosition)
-      @editor.setCursorBufferPosition(startPosition.translate([0, 1]))
-    else if previousPosition.isEqual(endPosition)
-      @editor.setCursorBufferPosition(startPosition)
+    if @tagHighlighted
+      startRange = @startMarker.getBufferRange()
+      tagLength = startRange.end.column - startRange.start.column
+      endRange = @endMarker.getBufferRange()
+      if startRange.compare(endRange) > 0
+        [startRange, endRange] = [endRange, startRange]
+
+      # include the <
+      startRange = new Range(startRange.start.traverse([0, -1]), endRange.end.traverse([0, -1]))
+      # include the </
+      endRange = new Range(endRange.start.traverse([0, -2]), endRange.end.traverse([0, -2]))
+
+      if position.isLessThan(endRange.start)
+        tagCharacterOffset = position.column - startRange.start.column
+        tagCharacterOffset++ if tagCharacterOffset > 0
+        tagCharacterOffset = Math.min(tagCharacterOffset, tagLength + 2) # include </
+        @editor.setCursorBufferPosition(endRange.start.traverse([0, tagCharacterOffset]))
+      else
+        tagCharacterOffset = position.column - endRange.start.column
+        tagCharacterOffset-- if tagCharacterOffset > 1
+        tagCharacterOffset = Math.min(tagCharacterOffset, tagLength + 1) # include <
+        @editor.setCursorBufferPosition(startRange.start.traverse([0, tagCharacterOffset]))
+    else
+      previousPosition = position.traverse([0, -1])
+      startPosition = @startMarker.getStartBufferPosition()
+      endPosition = @endMarker.getStartBufferPosition()
+
+      if position.isEqual(startPosition)
+        @editor.setCursorBufferPosition(endPosition.traverse([0, 1]))
+      else if previousPosition.isEqual(startPosition)
+        @editor.setCursorBufferPosition(endPosition)
+      else if position.isEqual(endPosition)
+        @editor.setCursorBufferPosition(startPosition.traverse([0, 1]))
+      else if previousPosition.isEqual(endPosition)
+        @editor.setCursorBufferPosition(startPosition)
 
   goToEnclosingPair: ->
     return if @pairHighlighted
-    return unless @editorView.underlayer.isVisible()
-    position = @editor.getCursorBufferPosition()
-    matchPosition = @findAnyStartPair(position)
-    if matchPosition
+
+    if matchPosition = @findAnyStartPair(@editor.getCursorBufferPosition())
       @editor.setCursorBufferPosition(matchPosition)
+    else if pair = @tagFinder.findEnclosingTags()
+      {startRange, endRange} = pair
+      if startRange.compare(endRange) > 0
+        [startRange, endRange] = [endRange, startRange]
+      @editor.setCursorBufferPosition(pair.startRange.start)
 
   selectInsidePair: ->
-    return unless @editorView.underlayer.isVisible()
-
     if @pairHighlighted
-      startPosition = @startView.bufferPosition
-      endPosition = @endView.bufferPosition
+      startRange = @startMarker.getBufferRange()
+      endRange = @endMarker.getBufferRange()
+
+      if startRange.compare(endRange) > 0
+        [startRange, endRange] = [endRange, startRange]
+
+      if @tagHighlighted
+        startPosition = startRange.end
+        endPosition = endRange.start.traverse([0, -2]) # Don't select </
+      else
+        startPosition = startRange.start
+        endPosition = endRange.start
     else
       if startPosition = @findAnyStartPair(@editor.getCursorBufferPosition())
         startPair = @editor.getTextInRange(Range.fromPointWithDelta(startPosition, 0, 1))
-        endPosition = @findMatchingEndPair(startPosition, startPair, startPairMatches[startPair])
+        endPosition = @findMatchingEndPair(startPosition, startPair, @matchManager.pairedCharacters[startPair])
+      else if pair = @tagFinder.findEnclosingTags()
+        {startRange, endRange} = pair
+        if startRange.compare(endRange) > 0
+          [startRange, endRange] = [endRange, startRange]
+        startPosition = startRange.end
+        endPosition = endRange.start.traverse([0, -2]) # Don't select </
 
     if startPosition? and endPosition?
-      rangeToSelect = new Range(startPosition, endPosition).translate([0, 1], [0, 0])
+      rangeToSelect = new Range(startPosition.traverse([0, 1]), endPosition)
       @editor.setSelectedBufferRange(rangeToSelect)
 
   # Insert at the current cursor position a closing tag if there exists an
   # open tag that is not closed afterwards.
   closeTag: ->
     cursorPosition = @editor.getCursorBufferPosition()
-    textLimits = @editor.getBuffer().getRange()
     preFragment = @editor.getTextInBufferRange([[0, 0], cursorPosition])
     postFragment = @editor.getTextInBufferRange([cursorPosition, [Infinity, Infinity]])
 
     if tag = @tagFinder.closingTagForFragments(preFragment, postFragment)
       @editor.insertText("</#{tag}>")
+
+  isCursorOnCommentOrString: ->
+    @commentOrStringSelector.matches(@editor.getLastCursor().getScopeDescriptor().getScopesArray())
+
+  isRangeCommentedOrString: (range) ->
+    @commentOrStringSelector.matches(@editor.scopeDescriptorForBufferPosition(range.start).getScopesArray())
